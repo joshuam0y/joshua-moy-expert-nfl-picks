@@ -4318,12 +4318,10 @@ function renderScoringPanel() {
       ${preset("espn", false, "ESPN PPR", "INT -2")}
       ${preset("espn", true, "ESPN Half PPR", "INT -2, 0.5 per catch")}
     </div>
-    <div class="sc-h">My Sleeper leagues</div>
-    ${S.leagues.map((l) => `<div class="sc-lg"><button class="sc-opt ${on("league", l.id)}" data-sc="league|${l.id}"><b>${esc(l.name)}</b><span>${esc(l.season || "")} \u00b7 ${leagueSummary(l.settings)}</span></button><button class="rm" data-sc-rm="${l.id}" title="Remove" aria-label="Remove">\u00d7</button></div>`).join("") || `<p class="note">Use your league's exact scoring: enter your Sleeper username (or a league ID).</p>`}
-    <div class="sc-find"><input id="sc-q" placeholder="Sleeper username or league ID" autocomplete="off" autocapitalize="off" spellcheck="false"><button class="tbtn" data-sc-find>Find</button></div>
-    ${S.scMsg ? `<p class="note">${esc(S.scMsg)}</p>` : ""}
-    ${S.scFound?.length ? S.scFound.map((l) => `<div class="sc-lg"><span><b>${esc(l.name)}</b> <span class="muted">${esc(l.season || "")} \u00b7 ${leagueSummary(l.scoring_settings)}</span></span><button class="tbtn" data-sc-add="${l.league_id}">Use</button></div>`).join("") : ""}
-    <p class="note">Kickers and defenses always use ESPN standard scoring. Your choices are saved on this device.</p>`;
+    <div class="sc-h">My leagues</div>
+    ${S.leagues.map((l) => `<div class="sc-lg"><button class="sc-opt ${on("league", l.id)}" data-sc="league|${l.id}"><b>${esc(l.name)}</b><span>${appName(l.source)} \u00b7 ${esc(l.season || "")} \u00b7 ${leagueSummary(l.settings)}</span></button><button class="rm" data-sc-rm="${l.id}" title="Remove" aria-label="Remove">\u00d7</button></div>`).join("") || `<p class="note">Add your leagues to use their exact scoring.</p>`}
+    <p><button class="tbtn on" data-sc-add-league>+ Add a league (Sleeper, ESPN or Yahoo)</button></p>
+    <p class="note">Picking a league here uses its scoring everywhere on the site. Kickers and defenses use the league's own scoring when it has them, otherwise ESPN standard. Your choices are saved on this device.</p>`;
 }
 
 function leagueSummary(w = {}) {
@@ -4854,6 +4852,7 @@ document.addEventListener("click", (e) => {
     redraw();
     return;
   }
+  if (t.closest("[data-sc-add-league]")) { $("#sc-panel").hidden = true; S.adding = true; S.syncMsg = ""; S.syncFound = null; goToSync(); return; }
   if (t.closest("#sc-btn")) { const panel = $("#sc-panel"); panel.hidden = !panel.hidden; if (!panel.hidden) renderScoringPanel(); return; }
   const pick = t.closest("[data-sc]");
   if (pick) {
@@ -4880,6 +4879,8 @@ document.addEventListener("click", (e) => {
   }
   const rmLg = t.closest("[data-sc-rm]");
   if (rmLg) {
+    // a synced league goes everywhere at once (its scoring, its roster and the League tab)
+    if (S.syncs.some((x) => x.league_id === rmLg.dataset.scRm)) { removeLeague(rmLg.dataset.scRm); renderScoringPanel(); return; }
     S.leagues = S.leagues.filter((l) => l.id !== rmLg.dataset.scRm);
     store("leagues", S.leagues);
     if (S.sc.mode === "league" && S.sc.league === rmLg.dataset.scRm) { S.sc = { mode: "sleeper", half: false }; store("scoring", S.sc); applyScoring(); }
