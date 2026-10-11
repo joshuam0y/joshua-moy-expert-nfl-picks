@@ -29,8 +29,22 @@ DEF_SCORING = {
 PTS_ALLOWED = [(0, 5), (6, 4), (13, 3), (17, 1), (27, 0), (34, -1), (45, -3), (10 ** 6, -5)]
 YDS_ALLOWED = [(99, 5), (199, 3), (299, 2), (349, 0), (399, -1), (449, -3), (499, -5), (549, -6), (10 ** 6, -7)]
 
+# Stats some fantasy leagues score beyond the standard ones: first downs, sacks taken, incompletions, long-play
+# and long-touchdown bonuses, return yards, and kicker and defense detail. Kept so the page can score any synced
+# Sleeper, ESPN or Yahoo league's settings exactly.
+LEAGUE_STATS = {
+    "pass_inc", "pass_sack", "pass_fd", "pass_td_40p", "pass_td_50p", "pass_cmp_40p", "pass_int_td", "fum",
+    "rush_fd", "rush_td_40p", "rush_td_50p", "rush_40p",
+    "rec_fd", "rec_td_40p", "rec_td_50p", "rec_40p", "rec_0_4", "rec_5_9", "rec_10_19", "rec_20_29", "rec_30_39",
+    "bonus_fd_qb", "bonus_fd_rb", "bonus_fd_wr", "bonus_fd_te", "bonus_rush_td_qb", "kr_yd", "pr_yd",
+    "fga", "fgm", "fgmiss_0_19", "fgmiss_20_29", "fgmiss_30_39", "fgmiss_40_49", "fgmiss_50_59", "fgmiss_50p", "fgmiss_60p",
+    "xpa", "xpmiss", "fgm_yds", "fgm_yds_over_30",
+    "def_2pt", "def_pass_def", "def_3_and_out", "def_4_and_stop", "def_forced_punts", "def_kr_td", "def_pr_td", "def_fum_td",
+    "ff", "qb_hit", "tkl_loss", "sack_yd", "int_ret_yd", "fum_ret_yd", "def_kr_yd", "def_pr_yd", "tkl", "tkl_solo", "tkl_ast",
+}
+
 # The raw stats kept from Sleeper (everything else is dropped to keep files small)
-STAT_KEYS = sorted(set(PPR) | set(K_SCORING) | set(DEF_SCORING)
+STAT_KEYS = sorted(set(PPR) | set(K_SCORING) | set(DEF_SCORING) | LEAGUE_STATS
                    | {"pass_cmp", "pass_att", "rush_att", "rec_tgt", "gp", "off_snp", "pts_ppr", "pts_half_ppr", "idp_fum_rec",
                       "pts_allow", "yds_allow", "tm_off_snp", "fgm_50p"})
 

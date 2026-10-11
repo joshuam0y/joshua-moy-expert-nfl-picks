@@ -89,14 +89,16 @@ def load_players():
     for pid, p in (sources.players() or {}).items():
         if p.get("position") in ("QB", "RB", "WR", "TE", "K", "DEF"):
             EVERYONE[pid] = {"name": p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
-                             "pos": p["position"], "espn_id": p.get("espn_id"), "team": p.get("team")}
+                             "pos": p["position"], "espn_id": p.get("espn_id"), "yahoo_id": p.get("yahoo_id"), "team": p.get("team")}
         if p.get("position") in ("QB", "RB", "WR", "TE", "K") and not p.get("team") and p.get("active") and (p.get("search_rank") or 9999) < 1500:
             FREE_AGENTS[pid] = {"name": p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
-                                "pos": p["position"], "injury": p.get("injury_status") or None}
+                                "pos": p["position"], "injury": p.get("injury_status") or None,
+                                "espn_id": p.get("espn_id"), "yahoo_id": p.get("yahoo_id")}
         if p.get("position") in ("K", "DEF") and p.get("team") and (p.get("active", True) or p["position"] == "DEF"):
             name = p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
             kdef[pid] = {"name": name, "pos": p["position"], "team": p["team"], "injury": p.get("injury_status"),
-                         "injury_part": p.get("injury_body_part"), "depth": p.get("depth_chart_order"), "espn_id": p.get("espn_id")}
+                         "injury_part": p.get("injury_body_part"), "depth": p.get("depth_chart_order"), "espn_id": p.get("espn_id"),
+                         "yahoo_id": p.get("yahoo_id")}
             continue
         if p.get("position") not in scoring.POSITION_CATEGORIES or not p.get("team"):
             continue
@@ -110,6 +112,7 @@ def load_players():
             "number": p.get("number"),
             "years": p.get("years_exp"),
             "espn_id": p.get("espn_id"),
+            "yahoo_id": p.get("yahoo_id"),
         }
     return keep, kdef
 
@@ -282,7 +285,7 @@ def game_log(pos, games):
              "st": {k: v for k, v in g["stats"].items() if v and k in SCORING_STATS}} for g in games]
 
 
-SCORING_STATS = set(scoring.PPR) | {"pass_cmp", "pass_att", "rush_att", "rec_tgt", "idp_fum_rec"}
+SCORING_STATS = set(scoring.PPR) | scoring.LEAGUE_STATS | {"pass_cmp", "pass_att", "rush_att", "rec_tgt", "idp_fum_rec"}
 
 
 def snap_share(games):
@@ -423,13 +426,18 @@ def kdef_entries(season, kdef, games, proj, history, previous, started):
             "id": pid, "name": p["name"], "pos": p["pos"], "team": p["team"], "opp": opp, "home": home, "game_id": g["id"],
             "injury": p["injury"], "injury_part": p["injury_part"], "depth": p["depth"],
             "proj_ppr": espn_proj, "proj_half": espn_proj, "games_this_season": len(hist),
+            # the stat lines behind those numbers, so the page can score a league's own kicker and defense settings
+            "proj": {k: v for k, v in (pr or {}).items() if k != "pts_ppr" and v},
+            "lg": [{"w": x["week"], "st": {k: v for k, v in x["stats"].items() if v and k in KDEF_STATS}} for x in hist],
             "avg_ppr": round(statistics.mean(pts), 2) if pts else None, "avg_half": round(statistics.mean(pts), 2) if pts else None, "props": [],
             **({"late": True} if g["id"] in started else {}),
         })
     return out
 
 
-FUTURE_KEYS = set(scoring.PPR) | set(scoring.K_SCORING) | set(scoring.DEF_SCORING) | {
+KDEF_STATS = set(scoring.K_SCORING) | set(scoring.DEF_SCORING) | scoring.LEAGUE_STATS | {"fgm_50p", "pts_allow", "yds_allow"}
+
+FUTURE_KEYS = set(scoring.PPR) | set(scoring.K_SCORING) | set(scoring.DEF_SCORING) | scoring.LEAGUE_STATS | {
     "pass_cmp", "pass_att", "rush_att", "rec_tgt", "fgm_50p", "pts_allow", "yds_allow"}
 
 
@@ -467,13 +475,15 @@ def future_weeks(season, week, entries, everyone, free_agents=None):
     byes = {team: sorted(weeks - ws) for team, ws in played_weeks.items()}
     # keep players projected for something real; everyone in this week's data stays regardless
     keep = {pid: v for pid, v in out.items() if v and (pid in in_week or sum(x.get("pp") or 0 for x in v) >= 10)}
-    meta = {pid: [everyone[pid]["name"], everyone[pid]["pos"], everyone[pid]["team"], everyone[pid].get("injury")]
+    # [name, pos, team, injury, espn id, yahoo id]: the ids let synced ESPN and Yahoo rosters match these players
+    ids = lambda p: [str(p["espn_id"]) if p.get("espn_id") else None, str(p["yahoo_id"]) if p.get("yahoo_id") else None]
+    meta = {pid: [everyone[pid]["name"], everyone[pid]["pos"], everyone[pid]["team"], everyone[pid].get("injury"), *ids(everyone[pid])]
             for pid in keep if pid not in in_week}
     # Free agents (no NFL team, like a released veteran) can still be on fantasy rosters: name them so the page
     # can show them on a synced league's roster, with no projection until they sign
     for pid, p in (free_agents or {}).items():
         if pid not in in_week and pid not in meta:
-            meta[pid] = [p["name"], p["pos"], None, p.get("injury")]
+            meta[pid] = [p["name"], p["pos"], None, p.get("injury"), *ids(p)]
     return {"season": season, "from_week": week + 1, "players": keep, "byes": byes, "meta": meta}
 
 
@@ -700,6 +710,10 @@ def run(refresh_all=False):
         espn = espn_ids.get(e["id"]) or players.get(e["id"], {}).get("espn_id")
         if espn:
             e["espn_id"] = str(espn)
+        # Yahoo's id lets a synced Yahoo league's rosters match players exactly
+        yahoo = (players.get(e["id"]) or kdef.get(e["id"]) or {}).get("yahoo_id")
+        if yahoo:
+            e["yahoo_id"] = str(yahoo)
         actual = this_week_stats.get(e["id"])
         e["actual"] = {"stats": actual["stats"], "ppr": scoring.fantasy_points(actual["stats"], e["pos"]),
                        "half": scoring.fantasy_points(actual["stats"], e["pos"], half=True)} if actual and played(actual) else None

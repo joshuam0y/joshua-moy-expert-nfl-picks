@@ -63,9 +63,16 @@ const S = {
   trade: store("trade") || { give: [], get: [] },
   yahoo: store("yahoo") || null,       // Yahoo tokens (from the Worker's sign-in)
   chat: [], chatBusy: false,
-  sync: store("sync") || null,         // the synced Sleeper league: {league_id, user_id, roster_id, name}
+  sync: store("sync") || null,         // the league the League tab and trade tools show: {league_id, user_id, roster_id, name, source}
   leagueData: null, ideas: null, syncMsg: "", syncFound: null, syncUser: null,   // My Picks: [{pid, key, dir, line, season, week, at}]
+  syncs: [],           // every synced league (Sleeper, ESPN, Yahoo), the active one included
+  lcache: {},          // league id -> its loaded rosters and settings
+  lview: null,         // League tab: "all" (every league at once) or one league's id
+  adding: false,       // League tab: showing the sync box to add another league
 };
+S.syncs = store("syncs") || (S.sync ? [S.sync] : []);
+S.sync = S.syncs.find((x) => x.league_id === S.sync?.league_id) || S.sync;
+if (S.sync && !S.syncs.includes(S.sync)) S.syncs.push(S.sync);
 
 // ---------------------------------------------------------------- helpers
 
@@ -148,8 +155,14 @@ function livePPR(p) {
   return c && !c.none ? fantasyPts(c.stats, p.pos) : null;
 }
 
-// Same as fantasy_points() in pull/scoring.py: Sleeper PPR or half PPR for skill players, ESPN standard for K and DEF
+// Same as fantasy_points() in pull/scoring.py: Sleeper PPR or half PPR for skill players, ESPN standard for K and DEF.
+// With a league chosen, its own scoring instead (kickers and defenses too, when the league scores them).
 function fantasyPts(s, pos) {
+  return ptsIn(currentLeague(), s, pos);
+}
+
+// The scoring menu's presets (no league)
+function presetPts(s, pos) {
   const table = (t, x = s) => Object.entries(t).reduce((a, [k, w]) => a + w * (x[k] || 0), 0);
   const tier = (v, tiers) => tiers.find(([most]) => v <= most)[1];
   if (pos === "K") {
@@ -163,7 +176,10 @@ function fantasyPts(s, pos) {
   if (pos === "DEF") {
     return Math.round((table(S.data.scoring_def) + tier(s.pts_allow || 0, S.data.def_tiers.pts) + tier(s.yds_allow || 0, S.data.def_tiers.yds)) * 100) / 100;
   }
-  return skillPts(s, pos);
+  let t = ppr(s);
+  if (S.sc.mode === "espn") t -= s.pass_int || 0;          // ESPN takes 2 per interception, Sleeper 1
+  if (S.sc.half) t -= 0.5 * (s.rec || 0);
+  return Math.round(t * 100) / 100;
 }
 
 function currentLeague() {
@@ -172,44 +188,125 @@ function currentLeague() {
 
 // QB/RB/WR/TE points in the chosen scoring
 function skillPts(s, pos) {
-  const lg = currentLeague();
-  if (lg) return scoreWith(lg.settings, s, pos);
-  let t = ppr(s);
-  if (S.sc.mode === "espn") t -= s.pass_int || 0;          // ESPN takes 2 per interception, Sleeper 1
-  if (S.sc.half) t -= 0.5 * (s.rec || 0);
-  return Math.round(t * 100) / 100;
+  return ptsIn(currentLeague(), s, pos);
+}
+
+// ---- league scoring: a Sleeper league's settings, or the rules read from an ESPN or Yahoo league
+
+// Who a scoring stat applies to, as in each app: kicker settings score only kickers, team-defense settings only
+// defenses, everything else every other position
+const DEF_ONLY = new Set(["sack", "int", "fum_rec", "safe", "blk_kick", "ff", "qb_hit", "tkl", "tkl_solo", "tkl_ast", "tkl_loss", "sack_yd", "int_ret_yd", "fum_ret_yd", "bonus_def_int_td_50p", "bonus_sack_2p"]);
+function statScope(k) {
+  if (/^(fg|xp)/.test(k)) return "K";
+  if (DEF_ONLY.has(k) || /^(def_|pts_allow|yds_allow|pa@|ya@)/.test(k)) return "DEF";
+  return "O";
+}
+const inScope = (scope, pos) => (scope === "O" ? pos !== "DEF" : scope === pos);
+
+const sumOf = (s, ...ks) => ks.reduce((a, k) => a + (s[k] || 0), 0);
+// Stats some apps score that are combinations of Sleeper's
+const COMBINED = {
+  "pass_inc*": (s) => s.pass_inc ?? Math.max(0, (s.pass_att || 0) - (s.pass_cmp || 0)),
+  "two_pt*": (s) => sumOf(s, "pass_2pt", "rush_2pt", "rec_2pt"),
+  "turnovers*": (s) => sumOf(s, "fum_lost", "pass_int"),
+  "ret_yd*": (s) => sumOf(s, "kr_yd", "pr_yd"),
+  "fgm*": (s) => s.fgm ?? sumOf(s, "fgm_0_19", "fgm_20_29", "fgm_30_39", "fgm_40_49", "fgm_50p"),
+  "fgm_0_39*": (s) => sumOf(s, "fgm_0_19", "fgm_20_29", "fgm_30_39"),
+  "fgmiss_0_39*": (s) => sumOf(s, "fgmiss_0_19", "fgmiss_20_29", "fgmiss_30_39"),
+  "fgm_50_59*": (s) => s.fgm_50_59 ?? Math.max(0, (s.fgm_50p || 0) - (s.fgm_60p || 0)),
+  "fgmiss_50_59*": (s) => s.fgmiss_50_59 ?? Math.max(0, (s.fgmiss_50p || 0) - (s.fgmiss_60p || 0)),
+  // Sleeper keeps a defense's interception and fumble return TDs together, and kick and punt return TDs together
+  "def_int_td*": (s) => Math.max(0, (s.def_td || 0) - (s.def_fum_td || 0)),
+  "def_kr_td*": (s) => s.def_kr_td ?? Math.max(0, (s.def_st_td || 0) - (s.def_pr_td || 0)),
+  "def_all_td*": (s) => sumOf(s, "def_td", "def_st_td"),
+  "def_ret_yd*": (s) => sumOf(s, "def_kr_yd", "def_pr_yd"),
+  // ESPN and Yahoo count a defense's special teams fumble recoveries with its other fumble recoveries
+  "def_fum_rec*": (s) => sumOf(s, "fum_rec", "def_st_fum_rec"),
+};
+
+// A stat's value in a stat line. "rush_yd/10": ESPN's whole points per 10 yards. "pass_yd@300-399", "pa@7-13",
+// "ya@500+": 1 when the stat (pa = points allowed, ya = yards allowed) is in that range.
+function statOf(k, s, pos) {
+  let m = k.match(/^(\w+)\/(\d+)$/);
+  if (m) return Math.floor((s[m[1]] || 0) / +m[2]);
+  m = k.match(/^(\w+)@(\d+)(?:-(\d+)|\+)$/);
+  if (m) {
+    const v = s[{ pa: "pts_allow", ya: "yds_allow" }[m[1]] || m[1]];
+    if (v == null) return 0;
+    return v >= +m[2] && (m[3] == null || v <= +m[3]) ? 1 : 0;
+  }
+  if (COMBINED[k]) return COMBINED[k](s);
+  return s[k] != null ? s[k] : derivedStat(k, s, pos);
 }
 
 // Score a stat line with Sleeper league settings: each setting's weight times the matching stat. Bonuses Sleeper
-// keeps as their own stats (TE premium, 100-yard games and so on) are derived from the base stats when missing.
+// keeps as their own stats (TE premium, 100-yard games, points-allowed tiers and so on) are derived from the base
+// stats when missing, as in projections.
 function scoreWith(w, s, pos) {
   let t = 0;
   for (const [k, v] of Object.entries(w || {})) {
-    if (!v) continue;
-    const x = s[k] != null ? s[k] : derivedStat(k, s, pos);
+    if (!v || !inScope(statScope(k), pos)) continue;
+    const x = statOf(k, s, pos);
     if (x) t += v * x;
   }
   return Math.round(t * 100) / 100;
 }
 
+// Score a stat line with rules read from ESPN or Yahoo: [{k, pts, scope, over: {TE: 1.5}, bonuses: [{target, points}]}]
+function scoreItems(items, s, pos) {
+  let t = 0;
+  for (const it of items) {
+    if (!inScope(it.scope, pos)) continue;
+    const pts = it.over?.[pos] ?? it.pts;
+    const v = statOf(it.k, s, pos);
+    if (v && pts) t += pts * v;
+    for (const b of it.bonuses || []) if (v >= b.target) t += b.points;
+  }
+  return Math.round(t * 100) / 100;
+}
+
+// Whether a league scores kickers (or defenses) itself; if not, they use ESPN standard scoring
+const leagueScores = (lg, pos) => (lg.items ? lg.items.some((x) => x.scope === pos && (x.pts || x.over)) : Object.entries(lg.settings || {}).some(([k, v]) => v && statScope(k) === pos));
+
+// A stat line's fantasy points in a league (null: the preset chosen in the scoring menu)
+function ptsIn(lg, s, pos) {
+  if (lg && ((pos !== "K" && pos !== "DEF") || leagueScores(lg, pos))) return lg.items ? scoreItems(lg.items, s, pos) : scoreWith(lg.settings, s, pos);
+  return presetPts(s, pos);
+}
+
 function derivedStat(k, s, pos) {
   let m = k.match(/^bonus_rec_(te|rb|wr|qb)$/);
   if (m) return (pos || "").toLowerCase() === m[1] ? s.rec || 0 : 0;
-  m = k.match(/^bonus_(pass|rush|rec)_yd_(\d+)$/);
-  if (m) return (s[`${m[1]}_yd`] || 0) >= +m[2] ? 1 : 0;
-  m = k.match(/^bonus_rush_rec_yd_(\d+)$/);
-  if (m) return (s.rush_yd || 0) + (s.rec_yd || 0) >= +m[1] ? 1 : 0;
+  if (k === "bonus_rush_td_qb") return pos === "QB" ? s.rush_td || 0 : 0;
+  // Sleeper's yardage bonuses are ranges: 300-399 and 400+ passing, 100-199 and 200+ rushing or receiving
+  m = k.match(/^bonus_(pass|rush|rec|rush_rec)_yd_(\d+)$/);
+  if (m) {
+    const v = m[1] === "rush_rec" ? (s.rush_yd || 0) + (s.rec_yd || 0) : s[`${m[1]}_yd`] || 0;
+    const lo = +m[2], hi = { 300: 399, 100: 199 }[lo];
+    return v >= lo && (hi == null || v <= hi) ? 1 : 0;
+  }
   if (k === "bonus_pass_cmp_25") return (s.pass_cmp || 0) >= 25 ? 1 : 0;
   if (k === "bonus_rush_att_20") return (s.rush_att || 0) >= 20 ? 1 : 0;
+  if (k === "fgm_50p") return (s.fgm_50_59 || 0) + (s.fgm_60p || 0);
+  // Sleeper's points-allowed and yards-allowed tiers (pts_allow_7_13, pts_allow_35p, yds_allow_0_100 ...)
+  m = k.match(/^(pts|yds)_allow_(\d+)(?:_(\d+)|(p))?$/);
+  if (m) {
+    const v = s[`${m[1]}_allow`];
+    if (v == null) return 0;
+    const lo = +m[2], hi = m[4] ? Infinity : m[3] != null ? (k === "yds_allow_0_100" ? 99 : +m[3]) : lo;
+    return v >= lo && v <= hi ? 1 : 0;
+  }
   return 0;
 }
 
 const isDefault = () => S.sc.mode === "sleeper";
 
-function projPts(p) {
-  if (p.pos === "K" || p.pos === "DEF") return p.proj_ppr;
-  if (isDefault()) return S.sc.half ? p.proj_half ?? p.proj_ppr : p.proj_ppr;
-  return p.proj && Object.keys(p.proj).length ? skillPts(p.proj, p.pos) : null;
+// This week's projection, in the chosen scoring or a given league's
+function projPts(p, lg = currentLeague()) {
+  const raw = p.proj && Object.keys(p.proj).length ? p.proj : null;
+  if (p.pos === "K" || p.pos === "DEF") return lg && raw && leagueScores(lg, p.pos) ? ptsIn(lg, raw, p.pos) : p.proj_ppr;
+  if (!lg && isDefault()) return S.sc.half ? p.proj_half ?? p.proj_ppr : p.proj_ppr;
+  return raw ? ptsIn(lg, raw, p.pos) : null;
 }
 
 function logPts(p, x) {
@@ -218,7 +315,11 @@ function logPts(p, x) {
 }
 
 function avgPts(p) {
-  if (p.pos === "K" || p.pos === "DEF") return p.avg_ppr;
+  if (p.pos === "K" || p.pos === "DEF") {
+    const lg = currentLeague();
+    if (lg && leagueScores(lg, p.pos) && p.lg?.length) return Math.round((p.lg.reduce((a, x) => a + ptsIn(lg, x.st, p.pos), 0) / p.lg.length) * 100) / 100;
+    return p.avg_ppr;
+  }
   if (isDefault()) return S.sc.half ? p.avg_half ?? p.avg_ppr : p.avg_ppr;
   const pts = (p.log || []).map((x) => logPts(p, x)).filter((v) => v != null);
   return pts.length ? Math.round((pts.reduce((a, b) => a + b, 0) / pts.length) * 100) / 100 : null;
@@ -591,10 +692,12 @@ async function load() {
   S.byId = {};
   S.byKey = {};
   S.byEspn = {};
+  S.byYahoo = {};
   for (const p of S.data.players) {
     S.byId[p.id] = p;
     S.byKey[`${normName(p.name)}|${p.team}`] = p.id;
     if (p.espn_id) S.byEspn[String(p.espn_id)] = p.id;
+    if (p.yahoo_id) S.byYahoo[String(p.yahoo_id)] = p.id;
   }
   for (const g of S.data.games) S.games[g.id] = { ...g, ...(S.games[g.id] || {}) };
   const built = new Date(S.data.generated_at);
@@ -1182,47 +1285,112 @@ async function syncFindUser(name) {
   rerenderLeagueViews();
 }
 
-async function syncLeague(leagueId, userId, source = "sleeper") {
-  S.syncMsg = "Loading rosters...";
-  rerenderLeagueViews();
+// Load a league from its app (Sleeper, ESPN or Yahoo) and keep it with your other synced leagues. activate: make it
+// the league the League tab, the scoring and the trade tools use.
+async function syncLeague(leagueId, userId, source = "sleeper", activate = true) {
+  if (activate) { S.syncMsg = "Loading rosters..."; rerenderLeagueViews(); }
   try {
-    let league, rosters, users;
+    let league, rosters, users, unmatched = [];
     let yMine = null;
-    if (source === "espn") ({ league, rosters, users } = await espnLeague(leagueId));
-    else if (source === "yahoo") ({ league, rosters, users, mine: yMine } = await yahooLeague(leagueId));
+    if (source === "espn") ({ league, rosters, users, unmatched } = await espnLeague(leagueId));
+    else if (source === "yahoo") ({ league, rosters, users, mine: yMine, unmatched } = await yahooLeague(leagueId));
     else [league, rosters, users] = await Promise.all([
       getJSON(`https://api.sleeper.app/v1/league/${leagueId}`),
       getJSON(`https://api.sleeper.app/v1/league/${leagueId}/rosters`),
       getJSON(`https://api.sleeper.app/v1/league/${leagueId}/users`),
     ]);
-    const fresh = S.sync?.league_id !== leagueId;
-    const mine = yMine != null ? rosters.find((r) => r.roster_id === yMine) : rosters.find((r) => r.owner_id === userId || (r.co_owners || []).includes(userId));
-    const keep = S.sync?.league_id === leagueId ? S.sync.roster_id : null;
-    S.sync = { league_id: leagueId, user_id: userId || null, roster_id: keep ?? mine?.roster_id ?? null, name: league.name, source, slots: league.roster_positions };
-    S.leagueData = { league, rosters, users };
-    store("sync", S.sync);
-    // the league's scoring and lineup become the site's
-    if (!S.leagues.some((l) => l.id === leagueId)) {
-      S.leagues.push({ id: leagueId, name: league.name, season: league.season, settings: league.scoring_settings, teams: league.total_rosters, roster_positions: league.roster_positions });
-      store("leagues", S.leagues);
+    const old = S.syncs.find((x) => x.league_id === leagueId);
+    const uid = userId || old?.user_id || null;
+    const mine = yMine != null ? rosters.find((r) => r.roster_id === yMine) : rosters.find((r) => uid && (r.owner_id === uid || (r.co_owners || []).includes(uid)));
+    const sync = old || { league_id: leagueId };
+    Object.assign(sync, { user_id: uid, roster_id: old?.roster_id ?? mine?.roster_id ?? null, name: league.name, source, slots: league.roster_positions, err: null });
+    if (sync.roster_id != null) sync.myIds = rosters.find((r) => r.roster_id === sync.roster_id)?.players || [];
+    if (!old) S.syncs.push(sync);
+    S.lcache[leagueId] = { league, rosters, users, unmatched };
+    S.mineSet = null;
+    store("syncs", S.syncs);
+    // its scoring, refreshed on every load so changes made in the app show up here
+    const lg = { id: leagueId, name: league.name, season: league.season, source, settings: league.scoring_settings, teams: league.total_rosters,
+      roster_positions: league.roster_positions, ...(league.items ? { items: league.items, unread: league.unread } : {}) };
+    const i = S.leagues.findIndex((l) => l.id === leagueId);
+    if (i >= 0) S.leagues[i] = lg; else S.leagues.push(lg);
+    store("leagues", S.leagues);
+    S.scVer = (S.scVer || 0) + 1;
+    if (S.sc.mode === "league" && S.sc.league === leagueId) { const b = $("#sc-btn"); if (b) b.textContent = `${scoringName()} ▾`; }
+    if (activate) {
+      const fresh = S.sync?.league_id !== leagueId;
+      S.sync = sync;
+      S.leagueData = S.lcache[leagueId];
+      S.adding = false;
+      store("sync", S.sync);
+      if (fresh || !S.sc.mode || S.sc.mode === "league") {
+        S.sc = { mode: "league", league: leagueId, half: false };
+        store("scoring", S.sc);
+        $("#sc-btn").textContent = `${scoringName()} ▾`;
+      }
+      if (fresh && S.syncs.length > 1 && S.lview !== "all") S.lview = leagueId;
+      S.syncFound = null;
+      S.syncMsg = "";
+      S.ideas = null;
+    } else if (S.sync?.league_id === leagueId) {
+      S.leagueData = S.lcache[leagueId];   // the active league, loaded in the background
     }
-    if (fresh || !S.sc.mode || S.sc.mode === "league") {
-      S.sc = { mode: "league", league: leagueId, half: false };
-      store("scoring", S.sc);
-      $("#sc-btn").textContent = `${scoringName()} ▾`;
-    }
-    S.syncFound = null;
-    S.syncMsg = "";
-    S.ideas = null;
   } catch (err) {
-    S.syncMsg = source === "yahoo" ? `Couldn't load that Yahoo league (${err.message}).` : source === "espn"
+    const msg = source === "yahoo" ? `Couldn't load that Yahoo league (${err.message}).` : source === "espn"
       ? err.message === "private"
         ? "That ESPN league is private. In Chrome, sign in to espn.com in this browser and try again, or make the league viewable to the public in its ESPN settings."
         : "Couldn't find that ESPN league. Check the leagueId in your league's ESPN address."
       : "Couldn't load that league from Sleeper.";
+    if (activate) S.syncMsg = msg;
+    const sx = S.syncs.find((x) => x.league_id === leagueId);
+    if (sx) sx.err = msg;
   }
-  rerenderLeagueViews();
+  if (activate) { rerenderLeagueViews(); updateSyncBtn(); }
+}
+
+// Switch the League tab, scoring and trade tools to another synced league
+function activateLeague(id) {
+  const sx = S.syncs.find((x) => x.league_id === id);
+  if (!sx) return;
+  S.sync = sx;
+  S.leagueData = S.lcache[id] || null;
+  S.lview = id;
+  S.ideas = null;
+  S.syncMsg = "";
+  store("sync", sx);
+  S.sc = { mode: "league", league: id, half: false };
+  store("scoring", S.sc);
+  const b = $("#sc-btn");
+  if (b) b.textContent = `${scoringName()} ▾`;
   updateSyncBtn();
+  render();
+}
+
+function removeLeague(id) {
+  S.syncs = S.syncs.filter((x) => x.league_id !== id);
+  delete S.lcache[id];
+  S.leagues = S.leagues.filter((l) => l.id !== id);
+  store("syncs", S.syncs);
+  store("leagues", S.leagues);
+  S.mineSet = null;
+  if (S.sync?.league_id === id) {
+    if (S.syncs.length) { activateLeague(S.syncs[0].league_id); if (S.syncs.length > 1) S.lview = "all"; return; }
+    S.sync = null; S.leagueData = null; S.ideas = null; S.lview = null;
+    store("sync", null);
+    if (S.sc.mode === "league" && S.sc.league === id) { S.sc = { mode: "sleeper", half: false }; store("scoring", S.sc); const b = $("#sc-btn"); if (b) b.textContent = `${scoringName()} ▾`; }
+  }
+  updateSyncBtn();
+  render();
+}
+
+// Load every synced league that isn't loaded yet (for the All my leagues view)
+let allLoading = null;
+function loadAllLeagues() {
+  if (allLoading) return allLoading;
+  const todo = S.syncs.filter((x) => !S.lcache[x.league_id] && !x.err);
+  if (!todo.length) return Promise.resolve();
+  allLoading = loadFuture().then(() => Promise.all(todo.map((x) => syncLeague(x.league_id, x.user_id, x.source || "sleeper", false)))).finally(() => { allLoading = null; });
+  return allLoading;
 }
 
 function rerenderLeagueViews() {
@@ -1236,17 +1404,81 @@ function rerenderLeagueViews() {
 
 const ESPN_FF = "https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons";
 const ESPN_POS = { 1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DEF" };
-// ESPN lineup slot ids -> Sleeper slot names
-const ESPN_SLOT = { 0: "QB", 2: "RB", 4: "WR", 6: "TE", 23: "FLEX", 7: "SUPER_FLEX", 3: "WRRB_FLEX", 5: "REC_FLEX", 16: "DEF", 17: "K", 20: "BN" };
-// ESPN scoring stat ids -> Sleeper stat names (the offensive ones that matter for skill players)
-const ESPN_STAT = { 3: "pass_yd", 4: "pass_td", 19: "pass_2pt", 20: "pass_int", 24: "rush_yd", 25: "rush_td", 26: "rush_2pt",
-  42: "rec_yd", 43: "rec_td", 44: "rec_2pt", 53: "rec", 72: "fum_lost" };
+// ESPN lineup slot ids -> Sleeper slot names (20 bench, 21 IR)
+const ESPN_SLOT = { 0: "QB", 2: "RB", 4: "WR", 6: "TE", 23: "FLEX", 7: "SUPER_FLEX", 3: "WRRB_FLEX", 5: "REC_FLEX", 16: "DEF", 17: "K", 20: "BN", 21: "IR" };
+const ESPN_SLOT_NAME = { 1: "TQB", 8: "DT", 9: "DE", 10: "LB", 11: "DL", 12: "CB", 13: "S", 14: "DB", 15: "DP", 18: "P", 19: "HC", 24: "ER" };
+// ESPN's per-position point overrides are keyed by lineup slot
+const ESPN_OVER_SLOT = { QB: "0", RB: "2", WR: "4", TE: "6", K: "17", DEF: "16" };
+// ESPN scoring stat ids -> [the stat in Sleeper's terms (see statOf), label]. Ids from ESPN's own stat list.
+const ESPN_RULE = {
+  0: ["pass_att", "Pass attempt"], 1: ["pass_cmp", "Completion"], 2: ["pass_inc*", "Incompletion"], 3: ["pass_yd", "Passing yard"], 4: ["pass_td", "Passing TD"],
+  5: ["pass_yd/5", "Every 5 passing yards"], 6: ["pass_yd/10", "Every 10 passing yards"], 7: ["pass_yd/20", "Every 20 passing yards"],
+  8: ["pass_yd/25", "Every 25 passing yards"], 9: ["pass_yd/50", "Every 50 passing yards"], 10: ["pass_yd/100", "Every 100 passing yards"],
+  15: ["pass_td_40p", "40+ yard TD pass bonus"], 16: ["pass_td_50p", "50+ yard TD pass bonus"], 17: ["pass_yd@300-399", "300-399 passing yards"],
+  18: ["pass_yd@400+", "400+ passing yards"], 19: ["pass_2pt", "2-pt pass"], 20: ["pass_int", "Interception thrown"], 22: ["pass_yd", "Passing yard"],
+  23: ["rush_att", "Carry"], 24: ["rush_yd", "Rushing yard"], 25: ["rush_td", "Rushing TD"], 26: ["rush_2pt", "2-pt run"],
+  27: ["rush_yd/5", "Every 5 rushing yards"], 28: ["rush_yd/10", "Every 10 rushing yards"], 29: ["rush_yd/20", "Every 20 rushing yards"],
+  30: ["rush_yd/25", "Every 25 rushing yards"], 31: ["rush_yd/50", "Every 50 rushing yards"], 32: ["rush_yd/100", "Every 100 rushing yards"],
+  35: ["rush_td_40p", "40+ yard TD run bonus"], 36: ["rush_td_50p", "50+ yard TD run bonus"], 37: ["rush_yd@100-199", "100-199 rushing yards"],
+  38: ["rush_yd@200+", "200+ rushing yards"], 40: ["rush_yd", "Rushing yard"],
+  41: ["rec", "Reception"], 42: ["rec_yd", "Receiving yard"], 43: ["rec_td", "Receiving TD"], 44: ["rec_2pt", "2-pt catch"],
+  45: ["rec_td_40p", "40+ yard TD catch bonus"], 46: ["rec_td_50p", "50+ yard TD catch bonus"],
+  47: ["rec_yd/5", "Every 5 receiving yards"], 48: ["rec_yd/10", "Every 10 receiving yards"], 49: ["rec_yd/20", "Every 20 receiving yards"],
+  50: ["rec_yd/25", "Every 25 receiving yards"], 51: ["rec_yd/50", "Every 50 receiving yards"], 52: ["rec_yd/100", "Every 100 receiving yards"],
+  53: ["rec", "Reception"], 56: ["rec_yd@100-199", "100-199 receiving yards"], 57: ["rec_yd@200+", "200+ receiving yards"], 58: ["rec_tgt", "Target"],
+  61: ["rec_yd", "Receiving yard"], 62: ["two_pt*", "2-pt conversion"], 63: ["fum_rec_td", "Fumble recovered for a TD"], 64: ["pass_sack", "Sacked"],
+  68: ["fum", "Fumble"], 72: ["fum_lost", "Fumble lost"], 73: ["turnovers*", "Turnover"],
+  74: ["fgm_50_59*", "FG made 50-59"], 76: ["fgmiss_50_59*", "FG missed 50-59"], 77: ["fgm_40_49", "FG made 40-49"], 79: ["fgmiss_40_49", "FG missed 40-49"],
+  80: ["fgm_0_39*", "FG made 0-39"], 82: ["fgmiss_0_39*", "FG missed 0-39"], 83: ["fgm*", "FG made"], 84: ["fga", "FG attempt"], 85: ["fgmiss", "FG missed"],
+  86: ["xpm", "Extra point made"], 87: ["xpa", "Extra point attempt"], 88: ["xpmiss", "Extra point missed"], 201: ["fgm_60p", "FG made 60+"], 203: ["fgmiss_60p", "FG missed 60+"],
+  89: ["pa@0-0", "0 points allowed"], 90: ["pa@1-6", "1-6 points allowed"], 91: ["pa@7-13", "7-13 points allowed"], 92: ["pa@14-17", "14-17 points allowed"],
+  121: ["pa@18-21", "18-21 points allowed"], 122: ["pa@22-27", "22-27 points allowed"], 123: ["pa@28-34", "28-34 points allowed"],
+  124: ["pa@35-45", "35-45 points allowed"], 125: ["pa@46+", "46+ points allowed"], 120: ["pts_allow", "Point allowed"], 187: ["pts_allow", "Point allowed"],
+  94: ["def_td", "Defensive TD"], 95: ["int", "Interception"], 96: ["def_fum_rec*", "Fumble recovery"], 97: ["blk_kick", "Blocked kick"], 98: ["safe", "Safety"], 99: ["sack", "Sack"],
+  101: ["def_kr_td*", "Kickoff return TD", "st_td"], 102: ["def_pr_td", "Punt return TD"], 103: ["def_int_td*", "Interception return TD"], 104: ["def_fum_td", "Fumble return TD"],
+  105: ["def_all_td*", "Defense or special teams TD"], 106: ["ff", "Forced fumble"], 113: ["def_pass_def", "Pass defended"], 127: ["yds_allow", "Yard allowed"],
+  128: ["ya@0-99", "Under 100 yards allowed"], 129: ["ya@100-199", "100-199 yards allowed"], 130: ["ya@200-299", "200-299 yards allowed"],
+  131: ["ya@300-349", "300-349 yards allowed"], 132: ["ya@350-399", "350-399 yards allowed"], 133: ["ya@400-449", "400-449 yards allowed"],
+  134: ["ya@450-499", "450-499 yards allowed"], 135: ["ya@500-549", "500-549 yards allowed"], 136: ["ya@550+", "550+ yards allowed"],
+  205: ["def_2pt", "Defensive 2-pt return"], 206: ["def_2pt", "Defensive 2-pt return"],
+};
 
 // ESPN team ids (fixed; ESPN's team list doesn't allow browser requests)
 const ESPN_TEAM_IDS = {"1":"ATL","2":"BUF","3":"CHI","4":"CIN","5":"CLE","6":"DAL","7":"DEN","8":"DET","9":"GB","10":"TEN","11":"IND","12":"KC","13":"LV","14":"LAR","15":"MIA","16":"MIN","17":"NE","18":"NO","19":"NYG","20":"NYJ","21":"PHI","22":"ARI","23":"PIT","24":"LAC","25":"SF","26":"SEA","27":"TB","28":"WAS","29":"CAR","30":"JAX","33":"BAL","34":"HOU"};
 
-async function espnTeamCodes() {
-  return ESPN_TEAM_IDS;
+// Matching another app's player to ours: its own id first (Sleeper keeps ESPN and Yahoo ids), then name and team,
+// then the name alone when only one player has it (a player traded since our last update)
+function playerMatcher() {
+  const byName = {}, byNameOnly = {};
+  for (const p of [...rosPool(), ...(S.extra || [])]) {
+    byName[`${normName(p.name)}|${p.team}`] = p.id;
+    const n = normName(p.name);
+    byNameOnly[n] = byNameOnly[n] === undefined ? p.id : null;   // null: more than one player with that name
+  }
+  return (name, team, ids = {}) => (ids.espn && S.byEspn[String(ids.espn)]) || (ids.yahoo && S.byYahoo[String(ids.yahoo)])
+    || byName[`${normName(name || "")}|${team}`] || byNameOnly[normName(name || "")] || null;
+}
+
+// Starters in the league's slot order (the way Sleeper lists them, "0" for an empty spot), from players tagged with
+// the slot they're in, so locked players stay in the right spot
+function orderStarters(slots, entries) {
+  const left = entries.filter((e) => e.slotName && e.slotName !== "BN" && e.slotName !== "IR");
+  return slots.filter((x) => SLOT_ELIG[x]).map((slot) => {
+    const i = left.findIndex((e) => e.slotName === slot);
+    return i >= 0 ? left.splice(i, 1)[0].id : "0";
+  });
+}
+
+// A short label for a rule list: "PPR, 6-pt pass TD, TE +0.5"
+function itemsSummaryMap(items) {
+  const w = {};
+  for (const it of items) {
+    if (it.k === "rec") { w.rec = (w.rec || 0) + it.pts; if (it.over?.TE != null) w.bonus_rec_te = it.over.TE - it.pts; }
+    if (it.k === "pass_td") w.pass_td = it.pts;
+    if (it.k === "pass_int") w.pass_int = it.pts;
+  }
+  if (w.rec == null) w.rec = 0;
+  return w;
 }
 
 async function espnLeague(leagueId) {
@@ -1256,38 +1488,78 @@ async function espnLeague(leagueId) {
   if (r.status === 401 || r.status === 403) throw new Error("private");
   if (!r.ok) throw new Error("missing");
   const d = await r.json();
-  const teams = await espnTeamCodes();
-  const byName = {};
-  for (const p of rosPool()) byName[`${normName(p.name)}|${p.team}`] = p.id;
+  const match = playerMatcher();
+  const unmatched = [];
   const toSleeper = (pl) => {
     const pos = ESPN_POS[pl.defaultPositionId];
-    const team = teams[pl.proTeamId];
+    const team = ESPN_TEAM_IDS[pl.proTeamId];
     if (pos === "DEF") return team && S.byId[team] ? team : null;
-    return S.byEspn[String(pl.id)] || byName[`${normName(pl.fullName || "")}|${team}`] || null;
+    const id = match(pl.fullName, team, { espn: pl.id });
+    if (!id && pl.fullName) unmatched.push(`${pl.fullName}${team ? ` (${team})` : ""}`);
+    return id;
   };
   const counts = d.settings?.rosterSettings?.lineupSlotCounts || {};
   const roster_positions = Object.entries(counts).flatMap(([slot, n]) => (ESPN_SLOT[slot] ? Array(n).fill(ESPN_SLOT[slot]) : []));
-  const scoring_settings = {};
-  for (const item of d.settings?.scoringSettings?.scoringItems || []) {
-    const k = ESPN_STAT[item.statId];
-    if (k) scoring_settings[k] = item.points;
+  const unslots = Object.entries(counts).filter(([slot, n]) => n && !ESPN_SLOT[slot]).map(([slot, n]) => `${n} ${ESPN_SLOT_NAME[slot] || `slot ${slot}`}`);
+  const items = [], unread = [];
+  for (const it of d.settings?.scoringSettings?.scoringItems || []) {
+    const rule = ESPN_RULE[it.statId];
+    const over = Object.fromEntries(Object.entries(ESPN_OVER_SLOT).map(([pos, slot]) => [pos, it.pointsOverrides?.[slot]]).filter(([, v]) => v != null));
+    if (!rule) { if (it.points || Object.keys(over).length) unread.push(`ESPN stat ${it.statId} (${it.points > 0 ? "+" : ""}${it.points})`); continue; }
+    items.push({ k: rule[0], label: rule[1], pts: it.points || 0, scope: statScope(rule[0]), ...(Object.keys(over).length ? { over } : {}) });
+    // return TDs score for individual players too (Sleeper counts a player's kick and punt return TDs together)
+    if (rule[2]) items.push({ k: rule[2], label: `${rule[1]} (player)`, pts: it.points || 0, scope: "O", ...(Object.keys(over).length ? { over } : {}) });
   }
   const members = Object.fromEntries((d.members || []).map((m) => [m.id, m.displayName]));
   return {
-    league: { league_id: String(leagueId), name: d.settings?.name || `ESPN league ${leagueId}`, season: String(S.data.season), total_rosters: d.teams.length, roster_positions, scoring_settings, source: "espn" },
-    rosters: d.teams.map((t) => ({ roster_id: t.id, owner_id: t.primaryOwner || (t.owners || [])[0],
-      settings: { wins: t.record?.overall?.wins, losses: t.record?.overall?.losses, ties: t.record?.overall?.ties, fpts: t.record?.overall?.pointsFor, fpts_against: t.record?.overall?.pointsAgainst },
-      players: (t.roster?.entries || []).map((e) => toSleeper(e.playerPoolEntry?.player || {})).filter(Boolean) })),
+    league: { league_id: String(leagueId), name: d.settings?.name || `ESPN league ${leagueId}`, season: String(S.data.season), total_rosters: d.teams.length, roster_positions,
+      scoring_settings: itemsSummaryMap(items), items, unread, unslots, source: "espn" },
+    rosters: d.teams.map((t) => {
+      const entries = (t.roster?.entries || []).map((e) => ({ id: toSleeper(e.playerPoolEntry?.player || {}), slot: e.lineupSlotId })).filter((x) => x.id);
+      return { roster_id: t.id, owner_id: t.primaryOwner || (t.owners || [])[0],
+        settings: { wins: t.record?.overall?.wins, losses: t.record?.overall?.losses, ties: t.record?.overall?.ties, fpts: t.record?.overall?.pointsFor, fpts_against: t.record?.overall?.pointsAgainst },
+        players: entries.map((x) => x.id),
+        starters: orderStarters(roster_positions, entries.map((x) => ({ id: x.id, slotName: ESPN_SLOT[x.slot] }))),
+        reserve: entries.filter((x) => x.slot === 21).map((x) => x.id) };
+    }),
     users: d.teams.map((t) => ({ user_id: t.primaryOwner || (t.owners || [])[0], display_name: members[t.primaryOwner] || "", metadata: { team_name: t.name || [t.location, t.nickname].filter(Boolean).join(" ") || t.abbrev } })),
+    unmatched,
   };
 }
 
 // ---- Yahoo leagues, through the site's Worker (Yahoo's API doesn't allow requests from web pages)
 
 const YAHOO_SLOT = { QB: "QB", RB: "RB", WR: "WR", TE: "TE", K: "K", DEF: "DEF", "W/R/T": "FLEX", "W/R": "WRRB_FLEX", "W/T": "REC_FLEX", "Q/W/R/T": "SUPER_FLEX", BN: "BN", IR: "IR" };
-// Yahoo scoring stat ids -> Sleeper stat names
-const YAHOO_STAT = { 4: ["pass_yd"], 5: ["pass_td"], 6: ["pass_int"], 9: ["rush_yd"], 10: ["rush_td"], 11: ["rec"], 12: ["rec_yd"], 13: ["rec_td"], 16: ["pass_2pt", "rush_2pt", "rec_2pt"], 18: ["fum_lost"] };
 const YAHOO_TEAM = { JAC: "JAX", WSH: "WAS", LA: "LAR" };
+// Yahoo scoring stats by name (from the league's own stat list), per who they score: O offense, K kickers, DEF defenses
+const YAHOO_NAME = {
+  "O:passingattempts": "pass_att", "O:completions": "pass_cmp", "O:incompletepasses": "pass_inc*", "O:passingyards": "pass_yd", "O:passingtouchdowns": "pass_td",
+  "O:interceptions": "pass_int", "O:sacks": "pass_sack", "O:rushingattempts": "rush_att", "O:rushingyards": "rush_yd", "O:rushingtouchdowns": "rush_td",
+  "O:receptions": "rec", "O:receivingyards": "rec_yd", "O:receivingtouchdowns": "rec_td", "O:returnyards": "ret_yd*", "O:returntouchdowns": "st_td",
+  "O:2pointconversions": "two_pt*", "O:fumbles": "fum", "O:fumbleslost": "fum_lost", "O:offensivefumblereturntd": "fum_rec_td", "O:targets": "rec_tgt",
+  "O:passing1stdowns": "pass_fd", "O:receiving1stdowns": "rec_fd", "O:rushing1stdowns": "rush_fd", "O:40yardcompletions": "pass_cmp_40p",
+  "O:40yardpassingtouchdowns": "pass_td_40p", "O:40yardrun": "rush_40p", "O:40yardrushingtouchdowns": "rush_td_40p", "O:40yardreceptions": "rec_40p",
+  "O:40yardreceivingtouchdowns": "rec_td_40p", "O:picksixesthrown": "pass_int_td",
+  "K:fieldgoals019yards": "fgm_0_19", "K:fieldgoals2029yards": "fgm_20_29", "K:fieldgoals3039yards": "fgm_30_39", "K:fieldgoals4049yards": "fgm_40_49", "K:fieldgoals50yards": "fgm_50p",
+  "K:fieldgoalsmissed019yards": "fgmiss_0_19", "K:fieldgoalsmissed2029yards": "fgmiss_20_29", "K:fieldgoalsmissed3039yards": "fgmiss_30_39",
+  "K:fieldgoalsmissed4049yards": "fgmiss_40_49", "K:fieldgoalsmissed50yards": "fgmiss_50p", "K:pointafterattemptmade": "xpm", "K:pointafterattemptmissed": "xpmiss",
+  "K:fieldgoalsmade": "fgm*", "K:fieldgoalsmissed": "fgmiss", "K:fieldgoalstotalyards": "fgm_yds", "K:fieldgoalyards": "fgm_yds",
+  "DEF:pointsallowed": "pts_allow", "DEF:sack": "sack", "DEF:interception": "int", "DEF:fumblerecovery": "def_fum_rec*", "DEF:touchdown": "def_td", "DEF:safety": "safe",
+  "DEF:blockkick": "blk_kick", "DEF:kickoffandpuntreturntouchdowns": "def_st_td", "DEF:returntouchdowns": "def_st_td", "DEF:returnyards": "def_ret_yd*",
+  "DEF:pointsallowed0points": "pa@0-0", "DEF:pointsallowed16points": "pa@1-6", "DEF:pointsallowed713points": "pa@7-13", "DEF:pointsallowed1420points": "pa@14-20",
+  "DEF:pointsallowed2127points": "pa@21-27", "DEF:pointsallowed2834points": "pa@28-34", "DEF:pointsallowed35points": "pa@35+",
+  "DEF:defensiveyardsallowed": "yds_allow", "DEF:yardsallowed": "yds_allow", "DEF:yardsallowed099": "ya@0-99", "DEF:yardsallowed100199": "ya@100-199",
+  "DEF:yardsallowed200299": "ya@200-299", "DEF:yardsallowed300399": "ya@300-399", "DEF:yardsallowed400499": "ya@400-499", "DEF:yardsallowed500": "ya@500+",
+  "DEF:defensiveyardsallowed099": "ya@0-99", "DEF:defensiveyardsallowed100199": "ya@100-199", "DEF:defensiveyardsallowed200299": "ya@200-299",
+  "DEF:defensiveyardsallowed300399": "ya@300-399", "DEF:defensiveyardsallowed400499": "ya@400-499", "DEF:defensiveyardsallowed500": "ya@500+",
+  "DEF:threeandouts": "def_3_and_out", "DEF:4thdownstops": "def_4_and_stop", "DEF:tacklesforloss": "tkl_loss", "DEF:extrapointreturned": "def_2pt",
+};
+// Yahoo's standard stat ids, used when the league's stat list doesn't name a stat
+const YAHOO_ID = { 1: "pass_att", 2: "pass_cmp", 3: "pass_inc*", 4: "pass_yd", 5: "pass_td", 6: "pass_int", 7: "pass_sack", 8: "rush_att", 9: "rush_yd", 10: "rush_td",
+  11: "rec", 12: "rec_yd", 13: "rec_td", 14: "ret_yd*", 15: "st_td", 16: "two_pt*", 17: "fum", 18: "fum_lost",
+  19: "fgm_0_19", 20: "fgm_20_29", 21: "fgm_30_39", 22: "fgm_40_49", 23: "fgm_50p", 24: "fgmiss_0_19", 25: "fgmiss_20_29", 26: "fgmiss_30_39", 27: "fgmiss_40_49", 28: "fgmiss_50p",
+  29: "xpm", 30: "xpmiss", 31: "pts_allow", 32: "sack", 33: "int", 34: "def_fum_rec*", 35: "def_td", 36: "safe", 37: "blk_kick", 49: "def_st_td",
+  50: "pa@0-0", 51: "pa@1-6", 52: "pa@7-13", 53: "pa@14-20", 54: "pa@21-27", 55: "pa@28-34", 56: "pa@35+", 57: "fum_rec_td", 78: "rec_tgt" };
 
 // Yahoo's JSON: lists come as {"0": {...}, "1": {...}, count} and records as arrays of small objects to merge
 const yList = (x, key) => (x ? Object.keys(x).filter((k) => /^\d+$/.test(k)).map((k) => x[k][key]) : []);
@@ -1323,18 +1595,30 @@ async function yahooLeague(key) {
   ]);
   const meta = yObj(settingsFc.league);
   const settings = (meta.settings || [])[0] || meta.settings || {};
-  const roster_positions = (settings.roster_positions || []).flatMap((x) => {
-    const r = x.roster_position || {};
-    return YAHOO_SLOT[r.position] ? Array(+r.count || 1).fill(YAHOO_SLOT[r.position]) : [];
-  });
-  const scoring_settings = {};
-  for (const x of settings.stat_modifiers?.stats || []) for (const k of YAHOO_STAT[x.stat?.stat_id] || []) scoring_settings[k] = +x.stat.value;
-  const byName = {};
-  for (const p of rosPool()) byName[`${normName(p.name)}|${p.team}`] = p.id;
+  const rp = (settings.roster_positions || []).map((x) => x.roster_position || {});
+  const roster_positions = rp.flatMap((r) => (YAHOO_SLOT[r.position] ? Array(+r.count || 1).fill(YAHOO_SLOT[r.position]) : []));
+  const unslots = rp.filter((r) => !YAHOO_SLOT[r.position]).map((r) => `${+r.count || 1} ${r.position}`);
+  // the league's stat list names each stat and says who it scores
+  const cats = {};
+  for (const c of settings.stat_categories?.stats || []) { const st = c.stat || {}; cats[st.stat_id] = st; }
+  const items = [], unread = [];
+  for (const x of settings.stat_modifiers?.stats || []) {
+    const id = x.stat?.stat_id, pts = +x.stat?.value || 0, cat = cats[id] || {};
+    const scope = { O: "O", K: "K", DT: "DEF" }[cat.position_type];
+    const name = cat.name || cat.display_name || "";
+    const k = (scope && YAHOO_NAME[`${scope}:${name.toLowerCase().replace(/[^a-z0-9]/g, "")}`]) || YAHOO_ID[id];
+    const bonuses = [].concat(x.stat?.bonuses || []).map((b) => b.bonus || b).map((b) => ({ target: +b.target, points: +b.points })).filter((b) => b.target && b.points);
+    if (!k) { if (pts || bonuses.length) unread.push(`${name || `Yahoo stat ${id}`} (${pts > 0 ? "+" : ""}${pts})`); continue; }
+    items.push({ k, label: name || k, pts, scope: statScope(k), ...(bonuses.length ? { bonuses } : {}) });
+  }
+  const match = playerMatcher();
+  const unmatched = [];
   const toSleeper = (pl) => {
     const team = YAHOO_TEAM[String(pl.editorial_team_abbr || "").toUpperCase()] || String(pl.editorial_team_abbr || "").toUpperCase();
     if ((pl.display_position || pl.primary_position) === "DEF") return S.byId[team] ? team : null;
-    return byName[`${normName(pl.name?.full || "")}|${team}`] || null;
+    const id = match(pl.name?.full, team, { yahoo: pl.player_id });
+    if (!id && pl.name?.full) unmatched.push(`${pl.name.full}${team ? ` (${team})` : ""}`);
+    return id;
   };
   const teams = yList(yObj(rostersFc.league).teams, "team");
   const standing = {};
@@ -1347,15 +1631,21 @@ async function yahooLeague(key) {
   const rosters = teams.map((t) => {
     const info = yObj(Array.isArray(t) ? t[0] : t);
     const roster = (Array.isArray(t) ? t[1] : t)?.roster || {};
-    const players = yList(roster["0"]?.players || roster.players, "player").map((pl) => toSleeper(yObj(pl))).filter(Boolean);
+    const entries = yList(roster["0"]?.players || roster.players, "player").map((raw) => {
+      const pl = yObj(raw);
+      return { id: toSleeper(pl), slot: yObj(pl.selected_position).position };
+    }).filter((x) => x.id);
     if (+info.is_owned_by_current_login === 1) mine = +info.team_id;
-    return { roster_id: +info.team_id, owner_id: `y${info.team_id}`, players, settings: standing[info.team_id] || {}, _name: info.name };
+    return { roster_id: +info.team_id, owner_id: `y${info.team_id}`, players: entries.map((x) => x.id), settings: standing[info.team_id] || {}, _name: info.name,
+      starters: orderStarters(roster_positions, entries.map((x) => ({ id: x.id, slotName: YAHOO_SLOT[x.slot] }))), reserve: entries.filter((x) => x.slot === "IR").map((x) => x.id) };
   });
   return {
-    league: { league_id: key, name: meta.name || "Yahoo league", season: String(meta.season || S.data.season), total_rosters: rosters.length, roster_positions, scoring_settings, source: "yahoo" },
+    league: { league_id: key, name: meta.name || "Yahoo league", season: String(meta.season || S.data.season), total_rosters: rosters.length, roster_positions,
+      scoring_settings: itemsSummaryMap(items), items, unread, unslots, source: "yahoo" },
     rosters,
     users: rosters.map((r) => ({ user_id: r.owner_id, display_name: r._name, metadata: { team_name: r._name } })),
     mine,
+    unmatched,
   };
 }
 
@@ -1572,7 +1862,7 @@ function whyLine(id) {
 // The sync box, or the league's loading / pick-your-team states. Returns null once the league is ready.
 function leagueGate(intro) {
   const ld = S.leagueData;
-  if (!S.sync) {
+  if (!S.sync || S.adding) {
     const app = S.syncApp || "sleeper";
     const body = app === "sleeper"
       ? `<p class="note">Just your Sleeper username: we'll find your leagues and your team.</p>
@@ -1587,12 +1877,13 @@ function leagueGate(intro) {
       : `<p class="note">Signed in to Yahoo. <button class="tbtn" data-yahoo-find>Show my leagues</button> <button class="tbtn" data-yahoo-out>Sign out</button></p>
         ${(S.yahooLeagues || []).map((l) => `<div class="sc-lg"><span><b>${esc(l.name)}</b> <span class="muted">${l.num_teams} teams</span></span><button class="tbtn" data-yahoo-pick="${esc(l.league_key)}">Sync</button></div>`).join("")}`;
     return `<div class="card league-sync">
-      <b>Sync your league</b>
-      <p class="note">${intro}</p>
+      <b>${S.sync ? "Add another league" : "Sync your league"}</b>
+      <p class="note">${S.sync ? "Sync as many leagues as you like, from Sleeper, ESPN and Yahoo. All my leagues shows your players from every one of them together." : intro}</p>
       ${seg("data-sync-app", app, [["sleeper", "Sleeper"], ["espn", "ESPN"], ["yahoo", "Yahoo"]], "App")}
       ${body}
       ${S.syncMsg ? `<p class="note">${esc(S.syncMsg)}</p>` : ""}
-      ${app === "sleeper" ? (S.syncFound || []).map((l) => `<div class="sc-lg"><span><b>${esc(l.name)}</b> <span class="muted">${l.total_rosters} teams · ${leagueSummary(l.scoring_settings)}</span></span><button class="tbtn" data-sync-pick="${l.league_id}">Sync</button></div>`).join("") : ""}
+      ${app === "sleeper" ? (S.syncFound || []).map((l) => `<div class="sc-lg"><span><b>${esc(l.name)}</b> <span class="muted">${l.total_rosters} teams · ${leagueSummary(l.scoring_settings)}</span></span>${S.syncs.some((x) => x.league_id === l.league_id) ? `<span class="muted small">Synced</span>` : `<button class="tbtn" data-sync-pick="${l.league_id}">Sync</button>`}</div>`).join("") : ""}
+      ${S.sync ? `<p><button class="tbtn" data-cancel-add>Cancel</button></p>` : ""}
     </div>`;
   }
   if (!ld) {
@@ -1602,7 +1893,7 @@ function leagueGate(intro) {
   if (S.sync.roster_id == null) {
     return `<div class="card league-sync"><b>${esc(ld.league.name)}</b><p class="note">Which team is yours?</p>
       <div class="chips">${ld.rosters.map((r) => `<button class="chip" data-sync-team="${r.roster_id}">${esc(teamName(r.roster_id))}</button>`).join("")}</div>
-      <p><button class="tbtn" data-sync-clear>Use a different league</button></p></div>`;
+      <p><button class="tbtn" data-sync-clear>Remove this league</button></p></div>`;
   }
   return null;
 }
@@ -1623,9 +1914,9 @@ function lineupSummary() {
 
 function leagueHead() {
   const ld = S.leagueData;
-  return `<div class="league-h"><div><b>${esc(ld.league.name)}</b> <span class="muted">· ${esc(teamName(S.sync.roster_id))} · ${ld.rosters.length} teams · ${{ espn: "ESPN", yahoo: "Yahoo" }[S.sync.source] || "Sleeper"}</span>
+  return `<div class="league-h"><div><span class="lg-dot big" style="--lc:${leagueColor(S.sync)}"></span><b>${esc(ld.league.name)}</b> <span class="muted">· ${esc(teamName(S.sync.roster_id))} · ${ld.rosters.length} teams · ${appName(S.sync.source)}</span>
       <div class="league-set">Lineup: ${esc(lineupSummary())} · scoring: ${esc(leagueSummary(ld.league.scoring_settings))}</div></div>
-    <div><button class="tbtn" data-sync-refresh>Refresh</button> <button class="tbtn" data-sync-clear>Change</button></div></div>`;
+    <div><button class="tbtn" data-sync-refresh>Refresh</button> <button class="tbtn" data-sync-clear>Remove</button></div></div>`;
 }
 
 // Each team's starters at each position, ranked against the league (rest-of-season points)
@@ -1954,7 +2245,21 @@ function leagueSettings() {
   const named = scoring.filter(([k]) => SCORE_NAMES[k]), rest = scoring.filter(([k]) => !SCORE_NAMES[k]);
   const num = (v) => String(+(+v).toFixed(2));
   const val = (k, v) => (k.endsWith("_yd") ? `1 point per ${num(1 / v)} yards` : `${v > 0 ? "+" : ""}${num(v)}`);
-  return `<div class="set-grid">${facts.map(([k, v]) => `<div class="set-f"><span class="muted">${k}</span><b>${esc(v)}</b></div>`).join("")}</div>
+  const lg = S.leagues.find((l) => l.id === L.league_id);
+  // what the sync couldn't use, so you can tell whether our numbers match the app's
+  const issues = `${lg?.unread?.length ? `<div class="set-warn"><b>${lg.unread.length} scoring rule${lg.unread.length === 1 ? "" : "s"} we can't score yet</b> (their points aren't counted here): ${esc(lg.unread.join(", "))}</div>` : ""}
+    ${ld.unmatched?.length ? `<div class="set-warn"><b>${ld.unmatched.length} player${ld.unmatched.length === 1 ? "" : "s"} on rosters we couldn't match</b> (left off those rosters, so they could show up as free agents here): ${esc(ld.unmatched.join(", "))}</div>` : ""}
+    ${L.unslots?.length ? `<div class="set-warn"><b>Lineup spots not supported:</b> ${esc(L.unslots.join(", "))} (IDP, punter and coach spots are left out of lineups and points)</div>` : ""}`;
+  if (lg?.items) {
+    const scopeName = { O: "", K: "Kickers", DEF: "Defense" };
+    const groups = ["O", "K", "DEF"].map((sc) => [sc, lg.items.filter((x) => x.scope === sc && (x.pts || x.over || x.bonuses))]).filter(([, xs]) => xs.length);
+    const show = (x) => `${x.pts > 0 ? "+" : ""}${num(x.pts)}${x.over ? ` (${Object.entries(x.over).map(([p, v]) => `${p} ${v > 0 ? "+" : ""}${num(v)}`).join(", ")})` : ""}${(x.bonuses || []).map((b) => `, +${num(b.points)} at ${num(b.target)}`).join("")}`;
+    return `<div class="set-grid">${facts.map(([k, v]) => `<div class="set-f"><span class="muted">${k}</span><b>${esc(v)}</b></div>`).join("")}</div>
+      <h3>Scoring <small class="muted">read from ${appName(lg.source)}: ${lg.items.length} rules</small></h3>${issues}
+      ${groups.map(([sc, xs]) => `${scopeName[sc] ? `<h4>${scopeName[sc]}</h4>` : ""}<div class="set-sc">${xs.map((x) => `<div><span>${esc(x.label)}</span><b class="num">${esc(show(x))}</b></div>`).join("")}</div>`).join("")}
+      <p class="note">These are the rules as ${appName(lg.source)} reports them, and they score every player here. Kickers and defenses use them too when the league has them; otherwise ESPN's standard scoring.</p>`;
+  }
+  return `<div class="set-grid">${facts.map(([k, v]) => `<div class="set-f"><span class="muted">${k}</span><b>${esc(v)}</b></div>`).join("")}</div>${issues}
     <h3>Scoring</h3>
     <div class="set-sc">${named.map(([k, v]) => `<div><span>${SCORE_NAMES[k]}</span><b class="num">${esc(val(k, v))}</b></div>`).join("")}</div>
     ${rest.length ? `<details class="set-more"><summary>All ${rest.length} other scoring settings</summary><div class="set-sc">${rest.map(([k, v]) => `<div><span>${esc(k.replace(/_/g, " "))}</span><b class="num">${esc(String(v))}</b></div>`).join("")}</div></details>` : ""}`;
@@ -1981,14 +2286,130 @@ function myTeamSummary() {
 }
 
 function renderLeagueTab() {
-  const gate = leagueGate("Sync your Sleeper league with just your username, or an ESPN league by its ID, to see your team, this week's matchups, standings, every roster, the best free agents and trade ideas.");
-  if (gate) { $("#main").innerHTML = `<h2>League</h2>${gate}`; return; }
+  if (S.lview == null) S.lview = S.syncs.length > 1 ? "all" : S.sync?.league_id || null;
+  const all = S.lview === "all" && S.syncs.length > 1 && !S.adding;
+  const gate = all ? null : leagueGate("Sync your Sleeper league with just your username, an ESPN league by its ID, or your Yahoo leagues, to see your team, this week's matchups, standings, every roster, the best free agents and trade ideas. You can sync several and see them all at once.");
+  if (gate) { $("#main").innerHTML = `<h2>League</h2>${S.syncs.length && !S.adding ? leagueSwitcher() : ""}${gate}`; return; }
   if (!S.future) { $("#main").innerHTML = `<h2>League</h2><div class="empty">Loading projections...</div>`; loadFuture().then(() => { if (S.tab === "league") renderLeagueTab(); }); return; }
+  if (all) { $("#main").innerHTML = `<h2>League <small>All my leagues</small></h2>${leagueSwitcher()}${allLeaguesView()}`; return; }
   const view = S.leagueView || "team";
   const body = { team: leagueMyTeam, matchups: leagueMatchups, standings: leagueStandings, teams: leagueTeams, fa: leagueFreeAgents, activity: leagueActivity, draft: leagueDraft, settings: leagueSettings }[view]();
-  $("#main").innerHTML = `<h2>League <small>${esc(scoringName())}</small></h2><div class="card league">${leagueHead()}
+  $("#main").innerHTML = `<h2>League <small>${esc(scoringName())}</small></h2>${leagueSwitcher()}<div class="card league">${leagueHead()}
     <div class="lv-scroll">${seg("data-league-view", view, [["team", "My team"], ["matchups", "Matchups"], ["standings", "Standings"], ["teams", "Teams"], ["fa", "Free agents"], ["activity", "Activity"], ["draft", "Draft"], ["settings", "Settings"]], "View")}</div>
     <div class="league-body">${body}</div></div>`;
+}
+
+// ---- several leagues at once
+
+const appName = (src) => ({ espn: "ESPN", yahoo: "Yahoo" }[src] || "Sleeper");
+// Each league's color: its app's (Sleeper cyan, ESPN red, Yahoo purple), a second shade for a second league on the same app
+const LEAGUE_COLORS = { sleeper: ["#00e1e0", "#5ef0a8", "#7fd1ff"], espn: ["#ff5a5f", "#ff9f43", "#ff7eb6"], yahoo: ["#a37cff", "#7c9bff", "#d38cff"] };
+function leagueColor(x) {
+  const src = x?.source || "sleeper";
+  const same = S.syncs.filter((y) => (y.source || "sleeper") === src);
+  const pal = LEAGUE_COLORS[src] || LEAGUE_COLORS.sleeper;
+  return pal[Math.max(0, same.indexOf(x)) % pal.length];
+}
+
+function leagueSwitcher() {
+  const cur = S.lview === "all" && S.syncs.length > 1 ? "all" : S.sync?.league_id;
+  return `<div class="lg-switch" aria-label="Your leagues">
+    ${S.syncs.length > 1 ? `<button class="lg-chip ${cur === "all" ? "on" : ""}" data-lv="all">All my leagues</button>` : ""}
+    ${S.syncs.map((x) => `<button class="lg-chip ${cur === x.league_id ? "on" : ""}" data-lv="${esc(x.league_id)}" style="--lc:${leagueColor(x)}"><i class="lg-dot"></i>${esc(x.name || "League")}<span class="lg-app">${appName(x.source)}</span></button>`).join("")}
+    <button class="lg-chip add" data-add-league>+ Add league</button></div>`;
+}
+
+const teamNameIn = (ld, rid) => {
+  const r = ld.rosters.find((x) => x.roster_id === rid);
+  const u = ld.users.find((x) => x.user_id === r?.owner_id);
+  return u?.metadata?.team_name || u?.display_name || `Team ${rid}`;
+};
+
+// Run something in another league's scoring (start/sit's matchup-adjusted projection reads the chosen scoring)
+function inLeague(lg, fn) {
+  const keep = S.sc;
+  S.sc = { mode: "league", league: lg.id, half: false };
+  try { return fn(); } finally { S.sc = keep; }
+}
+
+// A player's points this week in one league's scoring: the same projection start/sit uses before kickoff (Sleeper's,
+// adjusted for the matchup), live or final points after
+function weekIn(lg, p) {
+  const g = p.game_id && S.games[p.game_id];
+  if (!g) return { v: null, txt: "bye", note: "" };
+  if (g.state === "pre") { const v = lg ? inLeague(lg, () => ourProj(p)) : projPts(p); return { v, txt: v == null ? "-" : fmtPts(v), note: "proj" }; }
+  const c = current(p);
+  if (!c || c.none) return { v: 0, txt: g.state === "post" ? "DNP" : "0.00", note: g.state === "in" ? "live" : "final" };
+  return { v: ptsIn(lg, c.stats, p.pos), txt: fmtPts(ptsIn(lg, c.stats, p.pos)), note: g.state === "in" ? "live" : "final" };
+}
+
+function allLeaguesView() {
+  const pending = S.syncs.filter((x) => !S.lcache[x.league_id] && !x.err);
+  if (pending.length) loadAllLeagues().then(() => { if (S.tab === "league" && S.lview === "all") renderLeagueTab(); });
+  const L = S.syncs.map((x) => {
+    const ld = S.lcache[x.league_id];
+    return { x, ld, r: ld && x.roster_id != null ? ld.rosters.find((y) => y.roster_id === x.roster_id) : null, lg: S.leagues.find((l) => l.id === x.league_id), color: leagueColor(x) };
+  });
+  const ready = L.filter((m) => m.r);
+  const statusIn = (m, id) => ((m.r.reserve || []).includes(id) ? "ir" : (m.r.starters || []).includes(id) ? "start" : m.r.starters ? "bench" : "on");
+  const STATUS = { start: "Start", bench: "Bench", ir: "IR", on: "Rostered" };
+
+  // league cards: your team, record, scoring and anything the sync couldn't read
+  const cards = L.map((m) => {
+    const head = `<div class="ml-card-h"><i class="lg-dot" style="--lc:${m.color}"></i><b>${esc(m.x.name || "League")}</b><span class="lg-app">${appName(m.x.source)}</span></div>`;
+    if (m.x.err) return `<div class="ml-card" style="--lc:${m.color}">${head}<p class="note warn">${esc(m.x.err)}</p><button class="tbtn" data-lv="${esc(m.x.league_id)}">Open</button></div>`;
+    if (!m.ld) return `<div class="ml-card" style="--lc:${m.color}">${head}<p class="note">Loading...</p></div>`;
+    if (!m.r) return `<div class="ml-card" style="--lc:${m.color}">${head}<p class="note">Pick your team in this league to include it.</p><button class="tbtn" data-lv="${esc(m.x.league_id)}">Pick my team</button></div>`;
+    const st = m.r.settings || {};
+    const rec = st.wins != null ? `${st.wins}-${st.losses || 0}${st.ties ? `-${st.ties}` : ""}` : "";
+    const warn = [
+      m.lg?.unread?.length ? `${m.lg.unread.length} scoring rule${m.lg.unread.length === 1 ? "" : "s"} not counted` : "",
+      m.ld.unmatched?.length ? `${m.ld.unmatched.length} player${m.ld.unmatched.length === 1 ? "" : "s"} not matched` : "",
+      m.ld.league.unslots?.length ? `${m.ld.league.unslots.join(", ")} not supported` : "",
+    ].filter(Boolean);
+    return `<div class="ml-card" style="--lc:${m.color}">${head}
+      <div class="small muted">${esc(teamNameIn(m.ld, m.x.roster_id))}${rec ? ` · ${rec}` : ""} · ${m.ld.rosters.length} teams</div>
+      <div class="small">Scoring: ${esc(leagueSummary(m.ld.league.scoring_settings))}${m.lg?.items ? ` · ${m.lg.items.length} rules read` : ""}</div>
+      ${warn.length ? `<div class="small warn">${esc(warn.join(" · "))}. <button class="linkish" data-lv="${esc(m.x.league_id)}" data-lv-view="settings">See which</button></div>` : `<div class="small ok">Scoring and rosters read in full</div>`}
+      <button class="tbtn" data-lv="${esc(m.x.league_id)}">Open league</button></div>`;
+  }).join("");
+
+  // lineup alerts: starters on bye, ruled out or hurt; empty starting spots
+  const alerts = [];
+  for (const m of ready) {
+    for (const id of m.r.starters || []) {
+      if (!id || id === "0") { alerts.push({ m, text: "an empty starting spot" }); continue; }
+      const p = S.byId[id];
+      if (!p) continue;
+      const inj = injOf(p).status || "";
+      if (!p.game_id) alerts.push({ m, p, text: `${p.name} is on bye or not playing this week` });
+      else if (/^(out|ir|pup|sus|doubtful)/i.test(inj)) alerts.push({ m, p, text: `${p.name} is listed ${inj}` });
+    }
+  }
+
+  // every player you roster, once, with a chip for each league he's on
+  const byPlayer = new Map();
+  for (const m of ready) for (const id of m.r.players || []) { if (!byPlayer.has(id)) byPlayer.set(id, []); if (!byPlayer.get(id).includes(m)) byPlayer.get(id).push(m); }
+  const ORDER = { QB: 0, RB: 1, WR: 2, TE: 3, K: 4, DEF: 5 };
+  const rows = [...byPlayer.entries()].map(([id, ms]) => {
+    const p = S.byId[id];
+    const pts = ms.map((m) => ({ m, w: p ? weekIn(m.lg, p) : { v: null, txt: "-", note: "" }, st: statusIn(m, id) }));
+    return { id, p, pts, best: Math.max(-1, ...pts.map((x) => x.w.v ?? -1)), starting: pts.some((x) => x.st === "start") };
+  }).sort((a, b) => (ORDER[a.p?.pos] ?? 9) - (ORDER[b.p?.pos] ?? 9) || b.best - a.best);
+  const f = S.mlFilter || "all";
+  const shown = rows.filter((x) => f === "all" || (f === "start" ? x.starting : f === "multi" ? x.pts.length > 1 : x.pts.some((y) => y.m.x.league_id === f)));
+
+  return `<div class="ml-cards">${cards}</div>
+    ${alerts.length ? `<div class="ml-alerts"><b>Lineup check</b><ul>${alerts.map((a) => `<li><i class="lg-dot" style="--lc:${a.m.color}"></i><span class="muted">${esc(a.m.x.name)}:</span> ${a.p ? `<span class="linkish" data-open="${a.p.id}">${esc(a.text)}</span>` : esc(a.text)}</li>`).join("")}</ul></div>` : ready.length ? `<div class="ml-alerts ok">Lineup check: every starter in every league has a game and isn't ruled out.</div>` : ""}
+    <div class="gtool">${seg("data-ml-filter", f, [["all", `All (${rows.length})`], ["start", "Starting somewhere"], ["multi", "In 2+ leagues"], ...ready.map((m) => [m.x.league_id, esc(m.x.name)])], "Show")}</div>
+    <div class="ml-list">${shown.map(({ id, p, pts }) => `<div class="ml-row" ${p ? `data-open="${id}"` : ""}>
+        ${p ? avatar(p) : `<span class="avatar"></span>`}
+        <div class="ml-main"><div><b>${esc(p?.name || pname(id))}</b>${p ? injBadge(p) : ""}</div>
+          <div class="small muted">${p ? `${p.pos} ${p.team}${p.game_id ? ` · ${esc(oppText(p))} · ${esc(gameStatus(S.games[p.game_id]))}` : " · bye"}` : ""}</div></div>
+        <div class="ml-chips">${pts.map(({ m, w, st }) => `<span class="ml-chip ${st}" style="--lc:${m.color}" title="${esc(m.x.name)} (${appName(m.x.source)}): ${STATUS[st]}, ${w.txt}${w.note ? ` ${w.note}` : ""} in its scoring">
+            <i class="lg-dot"></i><span class="ml-lg">${esc(m.x.name)}</span><span class="ml-st">${STATUS[st]}</span><b class="num">${w.txt}</b>${w.note === "live" ? `<span class="ml-live">live</span>` : ""}</span>`).join("")}</div>
+      </div>`).join("") || `<div class="empty">${ready.length ? "No players match." : "Loading your leagues..."}</div>`}</div>
+    <p class="note">Each chip is one of your leagues, in its color: whether he's in that lineup (Start, Bench or IR) and his points in that league's own scoring. Before kickoff that's his projection; once his game starts, his live points, then final. The same player can score differently in each league.</p>`;
 }
 
 // This week's points for start/sit: our pregame projection (Sleeper's, adjusted for the matchup) for games not
@@ -2051,8 +2472,8 @@ function startSit() {
     const out = [...set].filter((id) => !ours.has(id) && S.byId[id]), inn = [...ours].filter((id) => !set.has(id));
     const setTotal = [...set].reduce((a, id) => a + (S.byId[id] ? weekPts(S.byId[id]) : 0), 0);
     diff = out.length || inn.length
-      ? `<div class="verdict">Your Sleeper lineup differs: start ${inn.map((id) => `<b>${esc(S.byId[id].name)}</b>`).join(", ")} instead of ${out.map((id) => `<b>${esc(S.byId[id].name)}</b>`).join(", ")} for about <b>+${fmtPts(lu.total - setTotal)}</b> projected points.</div>`
-      : `<div class="verdict even">Your Sleeper lineup matches ours.</div>`;
+      ? `<div class="verdict">Your ${appName(S.sync.source)} lineup differs: start ${inn.map((id) => `<b>${esc(S.byId[id].name)}</b>`).join(", ")} instead of ${out.map((id) => `<b>${esc(S.byId[id].name)}</b>`).join(", ")} for about <b>+${fmtPts(lu.total - setTotal)}</b> projected points.</div>`
+      : `<div class="verdict even">Your ${appName(S.sync.source)} lineup matches ours.</div>`;
   }
   return `<h3>Start / sit, week ${S.data.week}</h3>${diff}
     ${lu.starters.map((s2) => (s2.pick ? row(s2.pick, s2.slot) : `<div class="lu"><span class="slot">${slotLabel(s2.slot)}</span><span class="muted">empty</span><span></span></div>`)).join("")}
@@ -3861,7 +4282,7 @@ function renderInjuries(head) {
 function updateSyncBtn() {
   const b = $("#sync-btn");
   if (!b) return;
-  b.textContent = S.sync ? `${S.sync.name || "My league"}` : "Sync league";
+  b.textContent = S.syncs.length > 1 ? `${S.syncs.length} leagues` : S.sync ? `${S.sync.name || "My league"}` : "Sync league";
   b.classList.toggle("on", !!S.sync);
   b.title = S.sync ? "Your lineup and trade ideas" : "Sync your Sleeper or ESPN league";
 }
@@ -3960,9 +4381,11 @@ async function loadFuture() {
     .then((f) => {
       S.future = f;
       // players not in this week's data (on bye or hurt), so league rosters and rankings still include them
-      S.extra = Object.entries(f.meta || {}).filter(([id]) => !S.byId[id]).map(([id, [name, pos, team, injury]]) => {
+      S.extra = Object.entries(f.meta || {}).filter(([id]) => !S.byId[id]).map(([id, [name, pos, team, injury, espn, yahoo]]) => {
         const p = { id, name, pos, team: team || "FA", injury, props: [], log: [], extra: true, freeAgent: !team };
         S.byId[id] = p;
+        if (espn) S.byEspn[espn] = id;
+        if (yahoo) S.byYahoo[yahoo] = id;
         return p;
       });
     })
@@ -3985,7 +4408,7 @@ function byesLeft(p) {
 // Rest of season: this week (if his game hasn't started) plus every remaining week
 function rosPts(p) {
   // memoized per scoring choice: the trade finder asks for these thousands of times
-  const key = `${S.sc.mode}|${S.sc.half}|${S.sc.league || ""}|${S.future ? 1 : 0}`;
+  const key = `${S.sc.mode}|${S.sc.half}|${S.sc.league || ""}|${S.scVer || 0}|${S.future ? 1 : 0}`;
   if (S.rosKey !== key) { S.rosKey = key; S.rosMemo = new Map(); }
   if (S.rosMemo.has(p.id)) return S.rosMemo.get(p.id);
   const g = S.games[p.game_id];
@@ -4060,10 +4483,11 @@ const withFlex = (list) => { const i = Math.max(...list.map((x, k) => (["RB", "W
 function mySet() {
   if (S.leagueData && S.sync?.roster_id != null) {
     const ids = myRoster()?.players || [];
-    if (S.sync.myIds?.join() !== ids.join()) { S.sync.myIds = ids; store("sync", S.sync); }
-    return new Set(ids);
+    if (S.sync.myIds?.join() !== ids.join()) { S.sync.myIds = ids; store("sync", S.sync); store("syncs", S.syncs); S.mineSet = null; }
   }
-  return new Set(S.sync?.myIds || []);
+  // your players in every synced league
+  if (!S.mineSet) S.mineSet = new Set([...S.syncs.flatMap((x) => x.myIds || []), ...(S.sync?.myIds || [])]);
+  return S.mineSet;
 }
 const isMine = (id) => !!S.sync && mySet().has(id);
 const mineTag = (p) => (isMine(p.id) ? `<span class="yours-tag" title="On your team">YOURS</span>` : "");
@@ -4492,9 +4916,24 @@ document.addEventListener("click", (e) => {
   const sp = t.closest("[data-sync-pick]");
   if (sp) { syncLeague(sp.dataset.syncPick, S.syncUser?.id); return; }
   const st2 = t.closest("[data-sync-team]");
-  if (st2) { S.sync.roster_id = +st2.dataset.syncTeam; store("sync", S.sync); S.ideas = null; rerenderLeagueViews(); return; }
-  if (t.closest("[data-sync-refresh]")) { S.leagueData = null; S.syncMsg = ""; rerenderLeagueViews(); return; }
-  if (t.closest("[data-sync-clear]")) { S.sync = null; S.leagueData = null; S.ideas = null; store("sync", null); rerenderLeagueViews(); updateSyncBtn(); return; }
+  if (st2) {
+    S.sync.roster_id = +st2.dataset.syncTeam;
+    S.sync.myIds = S.leagueData?.rosters.find((r) => r.roster_id === S.sync.roster_id)?.players || [];
+    S.mineSet = null; store("sync", S.sync); store("syncs", S.syncs); S.ideas = null; rerenderLeagueViews(); return;
+  }
+  if (t.closest("[data-sync-refresh]")) { S.leagueData = null; delete S.lcache[S.sync.league_id]; S.syncMsg = ""; rerenderLeagueViews(); return; }
+  if (t.closest("[data-sync-clear]")) { removeLeague(S.sync.league_id); return; }
+  const lgPick = t.closest("[data-lv]");
+  if (lgPick) {
+    if (lgPick.dataset.lvView) S.leagueView = lgPick.dataset.lvView;
+    if (lgPick.dataset.lv === "all") { S.lview = "all"; S.adding = false; renderLeagueTab(); }
+    else { S.adding = false; activateLeague(lgPick.dataset.lv); }
+    return;
+  }
+  if (t.closest("[data-add-league]")) { S.adding = true; S.syncMsg = ""; S.syncFound = null; renderLeagueTab(); return; }
+  if (t.closest("[data-cancel-add]")) { S.adding = false; S.syncMsg = ""; renderLeagueTab(); return; }
+  const mlf = t.closest("[data-ml-filter]");
+  if (mlf) { S.mlFilter = mlf.dataset.mlFilter; renderLeagueTab(); return; }
   const idea = t.closest("[data-idea]");
   if (idea) {
     const x = S.ideas[+idea.dataset.idea];
